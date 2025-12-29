@@ -30,9 +30,9 @@ app.add_middleware(
 
 client = anthropic.Anthropic()
 
-# Hugging Face API for AI image detection
-HF_API_URL = "https://api-inference.huggingface.co/models/"
-HF_TOKEN = os.environ.get("HF_TOKEN", "")  # Optional: for higher rate limits
+# Sightengine API for AI image detection
+SIGHTENGINE_USER = os.environ.get("SIGHTENGINE_USER", "")
+SIGHTENGINE_SECRET = os.environ.get("SIGHTENGINE_SECRET", "")
 
 # ============================================
 # DATA MODELS
@@ -89,8 +89,8 @@ SUSPICIOUS_TLDS = [".xyz", ".top", ".click", ".link", ".info", ".online", ".site
 # HUGGING FACE AI DETECTION
 # ============================================
 
-async def detect_ai_image_huggingface(image_bytes: bytes) -> dict:
-    """Use Hugging Face models to detect AI-generated images"""
+async def detect_ai_image_sightengine(image_bytes: bytes) -> dict:
+    """Use Sightengine to detect AI-generated images"""
     
     results = {
         "ai_detection_models": [],
@@ -98,80 +98,68 @@ async def detect_ai_image_huggingface(image_bytes: bytes) -> dict:
         "is_likely_ai": False
     }
     
-    # List of AI detection models to try
-    models = [
-        "umm-maybe/AI-image-detector",
-        "Organika/sdxl-detector", 
-    ]
+    if not SIGHTENGINE_USER or not SIGHTENGINE_SECRET:
+        results["ai_detection_models"].append({
+            "model": "sightengine",
+            "status": "error",
+            "error": "API keys not configured"
+        })
+        return results
     
-    headers = {}
-    if HF_TOKEN:
-        headers["Authorization"] = f"Bearer {HF_TOKEN}"
-    
-    probabilities = []
-    
-    async with httpx.AsyncClient(timeout=30.0) as http_client:
-        for model in models:
-            try:
-                response = await http_client.post(
-                    f"{HF_API_URL}{model}",
-                    headers=headers,
-                    content=image_bytes
-                )
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as http_client:
+            # Sightengine AI detection endpoint
+            files = {'media': ('image.jpg', image_bytes, 'image/jpeg')}
+            data = {
+                'api_user': SIGHTENGINE_USER,
+                'api_secret': SIGHTENGINE_SECRET,
+                'models': 'genai'
+            }
+            
+            response = await http_client.post(
+                "https://api.sightengine.com/1.0/check.json",
+                files=files,
+                data=data
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
                 
-                if response.status_code == 200:
-                    result = response.json()
-                    
-                    # Parse the result - format varies by model
-                    ai_prob = 0
-                    human_prob = 0
-                    
-                    if isinstance(result, list):
-                        for item in result:
-                            label = item.get("label", "").lower()
-                            score = item.get("score", 0)
-                            
-                            if "artificial" in label or "ai" in label or "generated" in label or "fake" in label:
-                                ai_prob = score
-                            elif "human" in label or "real" in label or "natural" in label:
-                                human_prob = score
-                        
-                        # If we only got one label, infer the other
-                        if ai_prob > 0 and human_prob == 0:
-                            human_prob = 1 - ai_prob
-                        elif human_prob > 0 and ai_prob == 0:
-                            ai_prob = 1 - human_prob
-                    
-                    ai_percentage = round(ai_prob * 100, 1)
-                    probabilities.append(ai_percentage)
+                if result.get("status") == "success":
+                    ai_score = result.get("type", {}).get("ai_generated", 0)
+                    ai_probability = round(ai_score * 100, 1)
                     
                     results["ai_detection_models"].append({
-                        "model": model.split("/")[-1],
-                        "ai_probability": ai_percentage,
-                        "human_probability": round(human_prob * 100, 1),
-                        "status": "success"
+                        "model": "sightengine-genai",
+                        "ai_probability": ai_probability,
+                        "human_probability": round((1 - ai_score) * 100, 1),
+                        "status": "success",
+                        "raw_score": ai_score
                     })
+                    
+                    results["average_ai_probability"] = ai_probability
+                    results["is_likely_ai"] = ai_probability > 50
                 else:
                     results["ai_detection_models"].append({
-                        "model": model.split("/")[-1],
+                        "model": "sightengine-genai",
                         "status": "error",
-                        "error": f"HTTP {response.status_code}"
+                        "error": result.get("error", {}).get("message", "Unknown error")
                     })
-                    
-            except Exception as e:
+            else:
                 results["ai_detection_models"].append({
-                    "model": model.split("/")[-1],
-                    "status": "error", 
-                    "error": str(e)
+                    "model": "sightengine-genai",
+                    "status": "error",
+                    "error": f"HTTP {response.status_code}"
                 })
-    
-    # Calculate average probability
-    if probabilities:
-        results["average_ai_probability"] = round(sum(probabilities) / len(probabilities), 1)
-        results["is_likely_ai"] = results["average_ai_probability"] > 50
+                
+    except Exception as e:
+        results["ai_detection_models"].append({
+            "model": "sightengine-genai",
+            "status": "error",
+            "error": str(e)
+        })
     
     return results
-
 
 # ============================================
 # CLAUDE VISION ANALYSIS
@@ -423,7 +411,7 @@ async def analyze_image(request: ImageAnalysisRequest):
             media_type = "image/jpeg"
         
         # Run both analyses in parallel
-        hf_result = await detect_ai_image_huggingface(image_bytes)
+        hf_result = await detect_ai_image_sightengine(image_bytes)
         claude_result = await analyze_image_with_claude(request.image_base64, media_type)
         
         # Combine results
