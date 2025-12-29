@@ -8,15 +8,16 @@ import re
 import json
 from datetime import datetime
 import httpx
+import os
 
 # ============================================
-# SENTINEL API v2.0 - Complete Protection
+# SENTINEL API v2.1 - Enhanced AI Detection
 # ============================================
 
 app = FastAPI(
     title="SENTINEL API",
-    description="AI-Powered Scam Detection, Image Analysis, Deepfake Detection & File Scanning",
-    version="2.0.0"
+    description="AI-Powered Scam Detection with Real AI Image/Video Detection",
+    version="2.1.0"
 )
 
 app.add_middleware(
@@ -28,6 +29,10 @@ app.add_middleware(
 )
 
 client = anthropic.Anthropic()
+
+# Hugging Face API for AI image detection
+HF_API_URL = "https://api-inference.huggingface.co/models/"
+HF_TOKEN = os.environ.get("HF_TOKEN", "")  # Optional: for higher rate limits
 
 # ============================================
 # DATA MODELS
@@ -44,12 +49,7 @@ class URLAnalysisRequest(BaseModel):
 class ImageAnalysisRequest(BaseModel):
     image_base64: str
     filename: Optional[str] = "image"
-    check_type: Optional[str] = "all"  # "ai_generated", "deepfake", "scam", "all"
-
-class AudioAnalysisRequest(BaseModel):
-    audio_base64: str
-    filename: Optional[str] = "audio"
-    claimed_identity: Optional[str] = None  # For voice verification
+    check_type: Optional[str] = "all"
 
 # ============================================
 # SCAM DETECTION PATTERNS
@@ -84,6 +84,196 @@ SCAM_PATTERNS = {
 }
 
 SUSPICIOUS_TLDS = [".xyz", ".top", ".click", ".link", ".info", ".online", ".site", ".club"]
+
+# ============================================
+# HUGGING FACE AI DETECTION
+# ============================================
+
+async def detect_ai_image_huggingface(image_bytes: bytes) -> dict:
+    """Use Hugging Face models to detect AI-generated images"""
+    
+    results = {
+        "ai_detection_models": [],
+        "average_ai_probability": 0,
+        "is_likely_ai": False
+    }
+    
+    # List of AI detection models to try
+    models = [
+        "umm-maybe/AI-image-detector",
+        "Organika/sdxl-detector", 
+    ]
+    
+    headers = {}
+    if HF_TOKEN:
+        headers["Authorization"] = f"Bearer {HF_TOKEN}"
+    
+    probabilities = []
+    
+    async with httpx.AsyncClient(timeout=30.0) as http_client:
+        for model in models:
+            try:
+                response = await http_client.post(
+                    f"{HF_API_URL}{model}",
+                    headers=headers,
+                    content=image_bytes
+                )
+                
+                if response.status_code == 200:
+                    result = response.json()
+                    
+                    # Parse the result - format varies by model
+                    ai_prob = 0
+                    human_prob = 0
+                    
+                    if isinstance(result, list):
+                        for item in result:
+                            label = item.get("label", "").lower()
+                            score = item.get("score", 0)
+                            
+                            if "artificial" in label or "ai" in label or "generated" in label or "fake" in label:
+                                ai_prob = score
+                            elif "human" in label or "real" in label or "natural" in label:
+                                human_prob = score
+                        
+                        # If we only got one label, infer the other
+                        if ai_prob > 0 and human_prob == 0:
+                            human_prob = 1 - ai_prob
+                        elif human_prob > 0 and ai_prob == 0:
+                            ai_prob = 1 - human_prob
+                    
+                    ai_percentage = round(ai_prob * 100, 1)
+                    probabilities.append(ai_percentage)
+                    
+                    results["ai_detection_models"].append({
+                        "model": model.split("/")[-1],
+                        "ai_probability": ai_percentage,
+                        "human_probability": round(human_prob * 100, 1),
+                        "status": "success"
+                    })
+                else:
+                    results["ai_detection_models"].append({
+                        "model": model.split("/")[-1],
+                        "status": "error",
+                        "error": f"HTTP {response.status_code}"
+                    })
+                    
+            except Exception as e:
+                results["ai_detection_models"].append({
+                    "model": model.split("/")[-1],
+                    "status": "error", 
+                    "error": str(e)
+                })
+    
+    # Calculate average probability
+    if probabilities:
+        results["average_ai_probability"] = round(sum(probabilities) / len(probabilities), 1)
+        results["is_likely_ai"] = results["average_ai_probability"] > 50
+    
+    return results
+
+
+# ============================================
+# CLAUDE VISION ANALYSIS
+# ============================================
+
+async def analyze_image_with_claude(image_base64: str, media_type: str) -> dict:
+    """Use Claude for deepfake, scam, and manipulation detection"""
+    
+    try:
+        ai_response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=2048,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": media_type,
+                            "data": image_base64
+                        }
+                    },
+                    {
+                        "type": "text",
+                        "text": """Analyze this image for:
+
+1. **DEEPFAKE DETECTION** (if faces present):
+   - Unnatural skin texture or blurring
+   - Inconsistent lighting on face
+   - Weird eye reflections or gaze
+   - Hair boundary issues
+   - Facial feature warping
+   - Blending artifacts around face edges
+
+2. **SCAM CONTENT DETECTION**:
+   - Fake bank notices or screenshots
+   - Fake prize/lottery announcements
+   - Fake government documents
+   - Fake celebrity endorsements
+   - Fake payment confirmations
+   - Phishing content
+
+3. **MANIPULATION DETECTION**:
+   - Clone stamp or healing artifacts
+   - Inconsistent shadows or lighting
+   - Edge anomalies from cutting/pasting
+   - Compression inconsistencies
+   - Text that looks added/edited
+
+4. **AI GENERATION MARKERS** (secondary check):
+   - Unnatural textures or patterns
+   - Warped or impossible geometry
+   - Strange hands, fingers, teeth
+   - Text/writing errors
+   - Repeating patterns
+   - Uncanny smoothness
+
+Respond in this exact JSON format:
+{
+    "has_face": true/false,
+    "deepfake_analysis": {
+        "is_deepfake": true/false,
+        "confidence": 0-100,
+        "indicators": ["indicator1", "indicator2"]
+    },
+    "scam_content": {
+        "is_scam": true/false,
+        "scam_type": "fake_screenshot/fake_document/fake_prize/phishing/none",
+        "confidence": 0-100,
+        "details": "explanation"
+    },
+    "manipulation": {
+        "is_manipulated": true/false,
+        "manipulation_type": "photoshop/splice/clone/text_edit/none",
+        "confidence": 0-100,
+        "indicators": ["indicator1", "indicator2"]
+    },
+    "ai_indicators": {
+        "has_ai_artifacts": true/false,
+        "artifacts_found": ["artifact1", "artifact2"],
+        "notes": "explanation"
+    },
+    "overall_risk": "critical/high/medium/low",
+    "summary": "2-3 sentence summary"
+}"""
+                    }
+                ]
+            }]
+        )
+        
+        response_text = ai_response.content[0].text
+        json_match = re.search(r'\{[\s\S]*\}', response_text)
+        
+        if json_match:
+            return json.loads(json_match.group())
+        else:
+            return {"error": "Could not parse response"}
+            
+    except Exception as e:
+        return {"error": str(e)}
+
 
 # ============================================
 # TEXT ANALYSIS ENDPOINT
@@ -207,97 +397,120 @@ Respond in this exact JSON format:
         "analyzed_at": datetime.now().isoformat()
     }
 
+
 # ============================================
-# IMAGE ANALYSIS ENDPOINT
+# COMPREHENSIVE IMAGE ANALYSIS ENDPOINT
 # ============================================
 
 @app.post("/analyze/image")
 async def analyze_image(request: ImageAnalysisRequest):
-    """Analyze image for AI generation, deepfakes, and scam content"""
+    """Comprehensive image analysis using multiple AI models"""
     
     try:
-        # Decode base64 to verify it's valid
-        image_data = base64.b64decode(request.image_base64)
+        # Decode base64
+        image_bytes = base64.b64decode(request.image_base64)
         
         # Determine media type
-        if image_data[:8] == b'\x89PNG\r\n\x1a\n':
+        if image_bytes[:8] == b'\x89PNG\r\n\x1a\n':
             media_type = "image/png"
-        elif image_data[:2] == b'\xff\xd8':
+        elif image_bytes[:2] == b'\xff\xd8':
             media_type = "image/jpeg"
-        elif image_data[:6] in (b'GIF87a', b'GIF89a'):
+        elif image_bytes[:6] in (b'GIF87a', b'GIF89a'):
             media_type = "image/gif"
-        elif image_data[:4] == b'RIFF' and image_data[8:12] == b'WEBP':
+        elif image_bytes[:4] == b'RIFF' and image_bytes[8:12] == b'WEBP':
             media_type = "image/webp"
         else:
-            media_type = "image/jpeg"  # Default
+            media_type = "image/jpeg"
         
-        # Analyze with Claude Vision
-        ai_response = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=2048,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": media_type,
-                            "data": request.image_base64
-                        }
-                    },
-                    {
-                        "type": "text",
-                        "text": """Analyze this image thoroughly for:
-
-1. **AI GENERATION DETECTION**: Is this image AI-generated (Midjourney, DALL-E, Stable Diffusion, etc.)?
-   Look for: unnatural textures, warped details, inconsistent lighting, strange hands/fingers, text errors, repeating patterns, uncanny smoothness
-
-2. **DEEPFAKE DETECTION**: If there's a face, does it show signs of being a deepfake?
-   Look for: unnatural skin texture, weird eye reflections, hair boundary issues, facial asymmetry, blending artifacts
-
-3. **SCAM CONTENT**: Does this image appear to be used for scams?
-   Look for: fake screenshots, fake bank notices, fake prizes, fake government documents, fake celebrity endorsements
-
-4. **MANIPULATION**: Has this image been digitally manipulated?
-   Look for: clone stamp artifacts, inconsistent shadows, edge anomalies, compression inconsistencies
-
-Respond in this exact JSON format:
-{
-    "is_ai_generated": true/false,
-    "ai_generation_confidence": 0-100,
-    "ai_generator_likely": "midjourney/dall-e/stable-diffusion/other/none",
-    "is_deepfake": true/false,
-    "deepfake_confidence": 0-100,
-    "is_scam_content": true/false,
-    "scam_type": "fake_screenshot/fake_document/fake_prize/fake_celebrity/other/none",
-    "is_manipulated": true/false,
-    "manipulation_type": "photoshop/face_swap/splice/none",
-    "findings": [
-        {"check": "AI Generation Markers", "status": "detected/clear", "detail": "explanation"},
-        {"check": "Facial Analysis", "status": "suspicious/clear/na", "detail": "explanation"},
-        {"check": "Scam Indicators", "status": "detected/clear", "detail": "explanation"},
-        {"check": "Manipulation Signs", "status": "detected/clear", "detail": "explanation"}
-    ],
-    "risk_level": "critical/high/medium/low",
-    "summary": "2-3 sentence summary of findings",
-    "recommendation": "What the user should do"
-}"""
-                    }
-                ]
-            }]
-        )
+        # Run both analyses in parallel
+        hf_result = await detect_ai_image_huggingface(image_bytes)
+        claude_result = await analyze_image_with_claude(request.image_base64, media_type)
         
-        response_text = ai_response.content[0].text
-        json_match = re.search(r'\{[\s\S]*\}', response_text)
+        # Combine results
+        ai_probability = hf_result.get("average_ai_probability", 0)
+        is_likely_ai = hf_result.get("is_likely_ai", False)
         
-        if json_match:
-            analysis = json.loads(json_match.group())
-            analysis["analyzed_at"] = datetime.now().isoformat()
-            return analysis
+        # Check Claude's AI indicators too
+        claude_ai_indicators = claude_result.get("ai_indicators", {})
+        if claude_ai_indicators.get("has_ai_artifacts", False):
+            # Boost AI probability if Claude also detected artifacts
+            ai_probability = min(100, ai_probability + 15)
+            is_likely_ai = ai_probability > 50
+        
+        # Determine overall risk
+        risk_factors = []
+        risk_score = 0
+        
+        # AI Generation Risk
+        if is_likely_ai:
+            risk_factors.append(f"AI-generated image detected ({ai_probability}% confidence)")
+            risk_score += 30
+        
+        # Deepfake Risk
+        deepfake_analysis = claude_result.get("deepfake_analysis", {})
+        if deepfake_analysis.get("is_deepfake", False):
+            risk_factors.append(f"Deepfake detected ({deepfake_analysis.get('confidence', 0)}% confidence)")
+            risk_score += 40
+        
+        # Scam Content Risk
+        scam_content = claude_result.get("scam_content", {})
+        if scam_content.get("is_scam", False):
+            risk_factors.append(f"Scam content: {scam_content.get('scam_type', 'unknown')}")
+            risk_score += 35
+        
+        # Manipulation Risk
+        manipulation = claude_result.get("manipulation", {})
+        if manipulation.get("is_manipulated", False):
+            risk_factors.append(f"Image manipulated: {manipulation.get('manipulation_type', 'unknown')}")
+            risk_score += 25
+        
+        risk_score = min(risk_score, 100)
+        
+        if risk_score >= 60:
+            overall_risk = "critical"
+        elif risk_score >= 40:
+            overall_risk = "high"
+        elif risk_score >= 20:
+            overall_risk = "medium"
         else:
-            raise ValueError("Could not parse AI response")
+            overall_risk = "low"
+        
+        # Build recommendation
+        if is_likely_ai and ai_probability > 70:
+            recommendation = "This image is very likely AI-generated. Do not trust it as authentic."
+        elif is_likely_ai:
+            recommendation = "This image shows signs of AI generation. Verify its authenticity before trusting."
+        elif deepfake_analysis.get("is_deepfake"):
+            recommendation = "This image appears to be a deepfake. Do not trust it."
+        elif scam_content.get("is_scam"):
+            recommendation = "This image contains scam content. Do not trust or act on it."
+        elif manipulation.get("is_manipulated"):
+            recommendation = "This image has been digitally manipulated. Verify with original source."
+        else:
+            recommendation = "No significant threats detected, but always verify important images."
+        
+        return {
+            "overall_risk": overall_risk,
+            "risk_score": risk_score,
+            "risk_factors": risk_factors,
             
+            "ai_detection": {
+                "is_ai_generated": is_likely_ai,
+                "ai_probability": ai_probability,
+                "models_used": hf_result.get("ai_detection_models", []),
+                "verdict": "AI-GENERATED" if ai_probability > 70 else "LIKELY AI" if ai_probability > 50 else "LIKELY REAL" if ai_probability < 30 else "UNCERTAIN"
+            },
+            
+            "deepfake_analysis": deepfake_analysis,
+            "scam_content": scam_content,
+            "manipulation": manipulation,
+            "ai_artifacts": claude_ai_indicators,
+            
+            "summary": claude_result.get("summary", "Analysis complete."),
+            "recommendation": recommendation,
+            "analyzed_at": datetime.now().isoformat()
+        }
+        
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Image analysis failed: {str(e)}")
 
@@ -306,13 +519,9 @@ Respond in this exact JSON format:
 async def analyze_image_upload(file: UploadFile = File(...)):
     """Upload and analyze an image file"""
     
-    # Read file
     contents = await file.read()
-    
-    # Convert to base64
     image_base64 = base64.b64encode(contents).decode('utf-8')
     
-    # Create request and analyze
     request = ImageAnalysisRequest(
         image_base64=image_base64,
         filename=file.filename
@@ -322,7 +531,48 @@ async def analyze_image_upload(file: UploadFile = File(...)):
 
 
 # ============================================
-# URL ANALYSIS ENDPOINT
+# VIDEO ANALYSIS ENDPOINT
+# ============================================
+
+@app.post("/analyze/video")
+async def analyze_video(file: UploadFile = File(...)):
+    """Analyze video for deepfakes and AI generation"""
+    
+    # For video, we'll extract key frames and analyze them
+    contents = await file.read()
+    
+    # Check file type
+    filename = file.filename.lower() if file.filename else ""
+    
+    if not any(filename.endswith(ext) for ext in ['.mp4', '.mov', '.avi', '.webm', '.mkv']):
+        raise HTTPException(status_code=400, detail="Unsupported video format. Use MP4, MOV, AVI, WebM, or MKV.")
+    
+    # For now, return guidance on video analysis
+    # Full video analysis requires ffmpeg for frame extraction
+    return {
+        "status": "video_analysis_limited",
+        "message": "Full video deepfake detection requires frame-by-frame analysis. For production, we recommend:",
+        "recommendations": [
+            "Extract key frames using ffmpeg",
+            "Analyze each frame for deepfake indicators",
+            "Check audio-visual sync for lip-sync deepfakes",
+            "Look for temporal inconsistencies across frames"
+        ],
+        "services_for_video": [
+            {"name": "Microsoft Video Authenticator", "url": "https://www.microsoft.com/en-us/ai/responsible-ai"},
+            {"name": "Sensity AI", "url": "https://sensity.ai/"},
+            {"name": "Deepware Scanner", "url": "https://deepware.ai/"}
+        ],
+        "file_received": {
+            "filename": file.filename,
+            "size_mb": round(len(contents) / (1024 * 1024), 2)
+        },
+        "analyzed_at": datetime.now().isoformat()
+    }
+
+
+# ============================================
+# URL ANALYSIS ENDPOINT  
 # ============================================
 
 @app.post("/analyze/url")
@@ -341,7 +591,7 @@ async def analyze_url(request: URLAnalysisRequest):
             break
     
     # Check for URL shorteners
-    shorteners = ["bit.ly", "tinyurl", "t.co", "goo.gl", "ow.ly", "is.gd", "buff.ly"]
+    shorteners = ["bit.ly", "tinyurl", "t.co", "goo.gl", "ow.ly", "is.gd", "buff.ly", "rebrand.ly"]
     for shortener in shorteners:
         if shortener in url:
             red_flags.append({"flag": "URL Shortener", "severity": "medium", "detail": "Uses URL shortener to hide destination"})
@@ -354,62 +604,61 @@ async def analyze_url(request: URLAnalysisRequest):
         risk_score += 25
     
     # Check for typosquatting
-    known_brands = ["google", "facebook", "amazon", "apple", "microsoft", "netflix", "paypal", "dbs", "ocbc", "singtel"]
+    known_brands = ["google", "facebook", "amazon", "apple", "microsoft", "netflix", "paypal", "dbs", "ocbc", "singtel", "grab", "gojek", "lazada", "shopee"]
     for brand in known_brands:
-        if brand in url and f"{brand}.com" not in url and f"{brand}.sg" not in url:
-            red_flags.append({"flag": "Possible Typosquatting", "severity": "critical", "detail": f"May be impersonating {brand}"})
-            risk_score += 30
-            break
+        # Check if brand name is in URL but not the official domain
+        if brand in url:
+            official_domains = [f"{brand}.com", f"{brand}.sg", f"{brand}.co", f"{brand}.in", f"www.{brand}"]
+            if not any(domain in url for domain in official_domains):
+                red_flags.append({"flag": "Possible Typosquatting", "severity": "critical", "detail": f"May be impersonating {brand}"})
+                risk_score += 30
+                break
     
     # Check for suspicious keywords in URL
-    suspicious_url_words = ["login", "verify", "secure", "account", "update", "confirm", "banking"]
+    suspicious_url_words = ["login", "verify", "secure", "account", "update", "confirm", "banking", "password", "signin", "authenticate"]
     for word in suspicious_url_words:
         if word in url:
             red_flags.append({"flag": "Suspicious URL Keywords", "severity": "medium", "detail": f"Contains '{word}' - common in phishing"})
             risk_score += 10
             break
     
+    # Check for excessive subdomains
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(request.url)
+        subdomain_count = parsed.netloc.count('.')
+        if subdomain_count > 3:
+            red_flags.append({"flag": "Excessive Subdomains", "severity": "medium", "detail": f"Has {subdomain_count} subdomains - may be hiding real domain"})
+            risk_score += 15
+    except:
+        pass
+    
+    # Check for HTTPS
+    if url.startswith("http://"):
+        red_flags.append({"flag": "No HTTPS", "severity": "medium", "detail": "Site doesn't use secure HTTPS connection"})
+        risk_score += 10
+    
     risk_score = min(risk_score, 100)
     
     if risk_score >= 60:
         risk_level = "critical"
+        recommendation = "DO NOT click this link. It shows strong signs of being a phishing/scam URL."
     elif risk_score >= 40:
         risk_level = "high"
+        recommendation = "Be very careful with this link. Verify the source before clicking."
     elif risk_score >= 20:
         risk_level = "medium"
+        recommendation = "This URL has some suspicious elements. Proceed with caution."
     else:
         risk_level = "low"
+        recommendation = "This URL appears relatively safe, but always verify important links."
     
     return {
         "url": request.url,
         "risk_level": risk_level,
         "risk_score": risk_score,
         "red_flags": red_flags,
-        "recommendation": "Do NOT click this link. It shows signs of being malicious." if risk_score >= 40 else "This URL appears relatively safe, but always exercise caution.",
-        "analyzed_at": datetime.now().isoformat()
-    }
-
-
-# ============================================
-# AUDIO/VOICE ANALYSIS ENDPOINT
-# ============================================
-
-@app.post("/analyze/audio")
-async def analyze_audio(request: AudioAnalysisRequest):
-    """Analyze audio for AI-generated voice and voice cloning"""
-    
-    # Note: Full audio analysis requires specialized ML models
-    # This is a placeholder that provides guidance
-    
-    return {
-        "status": "limited_analysis",
-        "message": "Full voice clone detection requires specialized audio ML models. For production, integrate with services like Azure Speaker Recognition or build custom models.",
-        "checks_available": [
-            "Voice pattern analysis",
-            "AI synthesis detection",
-            "Speaker verification"
-        ],
-        "recommendation": "For suspected voice cloning, verify the caller through a different channel (video call, in-person, or ask questions only the real person would know).",
+        "recommendation": recommendation,
         "analyzed_at": datetime.now().isoformat()
     }
 
@@ -423,50 +672,80 @@ async def analyze_file(file: UploadFile = File(...)):
     """Analyze uploaded file for malware indicators"""
     
     contents = await file.read()
-    filename = file.filename.lower()
+    filename = file.filename.lower() if file.filename else "unknown"
     file_size = len(contents)
     
     red_flags = []
     risk_score = 0
     
     # Check file extension
-    dangerous_extensions = ['.exe', '.bat', '.cmd', '.scr', '.pif', '.msi', '.jar', '.vbs', '.js', '.ps1', '.apk']
+    dangerous_extensions = ['.exe', '.bat', '.cmd', '.scr', '.pif', '.msi', '.jar', '.vbs', '.js', '.ps1', '.apk', '.dll', '.com']
     for ext in dangerous_extensions:
         if filename.endswith(ext):
             red_flags.append({"flag": "Dangerous file type", "severity": "critical", "detail": f"File type '{ext}' can execute malicious code"})
             risk_score += 40
             break
     
-    # Check for double extensions (e.g., document.pdf.exe)
+    # Check for double extensions
     if filename.count('.') > 1:
-        red_flags.append({"flag": "Double extension", "severity": "high", "detail": "Multiple file extensions detected - common malware trick"})
-        risk_score += 25
+        parts = filename.rsplit('.', 2)
+        if len(parts) >= 2:
+            red_flags.append({"flag": "Double extension", "severity": "high", "detail": f"Multiple file extensions detected - common malware trick"})
+            risk_score += 25
     
     # Check for macros in Office files
-    if filename.endswith(('.docm', '.xlsm', '.pptm')):
-        red_flags.append({"flag": "Macro-enabled document", "severity": "high", "detail": "This document can contain executable macros"})
-        risk_score += 30
+    macro_extensions = ['.docm', '.xlsm', '.pptm', '.dotm', '.xltm']
+    for ext in macro_extensions:
+        if filename.endswith(ext):
+            red_flags.append({"flag": "Macro-enabled document", "severity": "high", "detail": "This document can contain executable macros"})
+            risk_score += 30
+            break
     
     # Check file header magic bytes
-    if contents[:2] == b'MZ':  # Windows executable
-        red_flags.append({"flag": "Windows executable", "severity": "critical", "detail": "This is a Windows executable file"})
-        risk_score += 40
-    elif contents[:4] == b'PK\x03\x04':  # ZIP/APK/Office
-        if filename.endswith('.apk'):
-            red_flags.append({"flag": "Android APK", "severity": "high", "detail": "Android application package - verify source before installing"})
-            risk_score += 30
-    elif b'<script' in contents.lower()[:1000] or b'javascript:' in contents.lower()[:1000]:
-        red_flags.append({"flag": "Embedded scripts", "severity": "medium", "detail": "File contains JavaScript code"})
-        risk_score += 20
+    if len(contents) >= 4:
+        if contents[:2] == b'MZ':  # Windows executable
+            if not filename.endswith(('.exe', '.dll')):
+                red_flags.append({"flag": "Hidden executable", "severity": "critical", "detail": "File is actually a Windows executable despite different extension"})
+                risk_score += 50
+            else:
+                red_flags.append({"flag": "Windows executable", "severity": "high", "detail": "Executable files can run malicious code"})
+                risk_score += 35
+        
+        elif contents[:4] == b'PK\x03\x04':  # ZIP/APK/Office
+            if filename.endswith('.apk'):
+                red_flags.append({"flag": "Android APK", "severity": "high", "detail": "Android app - verify source before installing"})
+                risk_score += 30
+            elif not filename.endswith(('.zip', '.xlsx', '.docx', '.pptx', '.apk')):
+                red_flags.append({"flag": "Hidden archive", "severity": "medium", "detail": "File is actually an archive/ZIP despite extension"})
+                risk_score += 20
+        
+        elif contents[:4] == b'%PDF':  # PDF
+            # Check for JavaScript in PDF
+            if b'/JavaScript' in contents or b'/JS' in contents:
+                red_flags.append({"flag": "PDF with JavaScript", "severity": "high", "detail": "PDF contains JavaScript which could be malicious"})
+                risk_score += 25
+        
+        elif contents[:5] == b'<html' or contents[:14] == b'<!DOCTYPE html':
+            if not filename.endswith(('.html', '.htm')):
+                red_flags.append({"flag": "Hidden HTML", "severity": "medium", "detail": "File is actually HTML despite different extension"})
+                risk_score += 15
+    
+    # Check for suspicious strings
+    suspicious_strings = [b'cmd.exe', b'powershell', b'WScript', b'eval(', b'<script', b'fromCharCode']
+    for sus_string in suspicious_strings:
+        if sus_string in contents[:10000]:  # Check first 10KB
+            red_flags.append({"flag": "Suspicious code", "severity": "high", "detail": f"Contains potentially malicious code pattern"})
+            risk_score += 20
+            break
     
     risk_score = min(risk_score, 100)
     
     if risk_score >= 60:
         risk_level = "critical"
-        recommendation = "DO NOT OPEN THIS FILE. Delete it immediately."
+        recommendation = "DO NOT OPEN THIS FILE. It shows strong signs of being malicious. Delete it immediately."
     elif risk_score >= 40:
         risk_level = "high"
-        recommendation = "Be very cautious. Only open if you trust the source completely."
+        recommendation = "Be very cautious. Only open if you completely trust the source."
     elif risk_score >= 20:
         risk_level = "medium"
         recommendation = "Exercise caution. Verify the sender before opening."
@@ -476,7 +755,8 @@ async def analyze_file(file: UploadFile = File(...)):
     
     return {
         "filename": file.filename,
-        "file_size": file_size,
+        "file_size_bytes": file_size,
+        "file_size_readable": f"{file_size / 1024:.1f} KB" if file_size < 1024*1024 else f"{file_size / (1024*1024):.1f} MB",
         "risk_level": risk_level,
         "risk_score": risk_score,
         "red_flags": red_flags,
@@ -493,19 +773,28 @@ async def analyze_file(file: UploadFile = File(...)):
 async def root():
     return {
         "service": "SENTINEL API",
-        "version": "2.0.0",
+        "version": "2.1.0",
         "status": "operational",
+        "features": [
+            "Text/Message Scam Detection",
+            "AI Image Detection (Hugging Face + Claude)",
+            "Deepfake Detection",
+            "Scam Content Detection",
+            "URL Phishing Analysis",
+            "File Malware Scanning",
+            "Video Analysis (Limited)"
+        ],
         "endpoints": {
-            "text_analysis": "/analyze/text",
-            "image_analysis": "/analyze/image",
-            "image_upload": "/analyze/image/upload",
-            "url_analysis": "/analyze/url",
-            "audio_analysis": "/analyze/audio",
-            "file_analysis": "/analyze/file",
-            "documentation": "/docs"
+            "text_analysis": "POST /analyze/text",
+            "image_analysis": "POST /analyze/image",
+            "image_upload": "POST /analyze/image/upload",
+            "video_analysis": "POST /analyze/video",
+            "url_analysis": "POST /analyze/url",
+            "file_analysis": "POST /analyze/file",
+            "documentation": "GET /docs"
         }
     }
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
+    return {"status": "healthy", "version": "2.1.0", "timestamp": datetime.now().isoformat()}
